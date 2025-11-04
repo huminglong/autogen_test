@@ -1,1 +1,14 @@
+# AutoGen 核心依赖
+autogen-agentchat>=0.6.4
+autogen-ext[openai]>=0.6.4
+
+# 环境变量管理
 python-dotenv
+
+# 可选：Web Surfer 功能（如需要）
+# playwright
+# autogen-ext[web-surfer]
+
+# 可选：其他扩展
+# autogen-ext[azure]
+# autogen-ext[anthropic]

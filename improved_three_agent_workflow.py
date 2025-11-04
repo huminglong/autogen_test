@@ -15,10 +15,18 @@ load_dotenv()
 
 from autogen_agentchat.agents import AssistantAgent
 from autogen_agentchat.teams import RoundRobinGroupChat, SelectorGroupChat
-from autogen_agentchat.conditions import TextMentionTermination, MaxMessageTermination, ExternalTermination
+from autogen_agentchat.conditions import (
+    TextMentionTermination, 
+    MaxMessageTermination, 
+    ExternalTermination,
+    TimeoutTermination,
+    SourceMatchTermination
+)
 from autogen_agentchat.ui import Console
-from autogen_agentchat.messages import TextMessage
+from autogen_agentchat.messages import TextMessage, BaseAgentEvent, BaseChatMessage
+from autogen_agentchat.base import TaskResult
 from autogen_ext.models.openai import OpenAIChatCompletionClient
+from autogen_core import CancellationToken
 
 
 def build_model_client(api_key: Optional[str] = None, base_url: Optional[str] = None) -> OpenAIChatCompletionClient:
@@ -58,9 +66,13 @@ def build_agents(model_client: OpenAIChatCompletionClient):
     coder = AssistantAgent(
         name="coder",
         model_client=model_client,
-        description="Agent 1: 根据用户开发需求编写代码",
+        description=(
+            "初始代码编写专家。负责根据用户需求编写第一版完整可运行的代码实现。"
+            "擅长选择简单稳健的技术方案，处理需求歧义，快速产出可工作的代码原型。"
+            "当收到新的开发任务时，应该首先由该代理开始工作。"
+        ),
         system_message=(
-            "你是资深开发工程师(Agent 1: coder)。\n"
+            "你是资深开发工程师(coder)。\n"
             "任务: 基于用户的开发需求，编写满足需求的完整、可运行代码。\n"
             "要求:\n"
             "- 尽量选择简单、稳健、无外部依赖或仅使用标准库的实现(除非需求明确)。\n"
@@ -73,9 +85,13 @@ def build_agents(model_client: OpenAIChatCompletionClient):
     reviewer = AssistantAgent(
         name="reviewer",
         model_client=model_client,
-        description="Agent 2: 对 coder 的代码提出改进建议",
+        description=(
+            "代码审查与质量保证专家。负责对 coder 生成的代码进行深度审查，"
+            "从性能、安全性、可读性、健壮性、边界条件、测试覆盖等多个维度提供改进建议。"
+            "仅在 coder 完成初始代码后才开始工作。"
+        ),
         system_message=(
-            "你是代码审查专家(Agent 2: reviewer)。\n"
+            "你是代码审查专家(reviewer)。\n"
             "任务: 针对 coder 提供的代码，提出具体、可操作的改进建议(性能、可读性、健壮性、安全性、边界条件、测试等)。\n"
             "要求:\n"
             "- 请仅输出改进建议清单，不要粘贴或重写完整代码。\n"
@@ -88,9 +104,13 @@ def build_agents(model_client: OpenAIChatCompletionClient):
     integrator = AssistantAgent(
         name="integrator",
         model_client=model_client,
-        description="Agent 3: 综合 coder 代码与 reviewer 建议产出最终代码",
+        description=(
+            "代码集成与优化专家。负责整合 coder 的初始代码和 reviewer 的审查建议，"
+            "产出经过优化和完善的最终生产级代码。确保所有建议被合理采纳，代码质量达到最高标准。"
+            "仅在 reviewer 完成审查后才开始工作，完成后输出 TERMINATE 结束流程。"
+        ),
         system_message=(
-            "你是集成与优化专家(Agent 3: integrator)。\n"
+            "你是集成与优化专家(integrator)。\n"
             "任务: 基于 coder 的初版代码和 reviewer 的改进建议，输出优化与完善后的最终代码。\n"
             "要求:\n"
             "- 最终输出仅包含完整、可运行的最终代码，放在单个完整代码块中。\n"
@@ -102,6 +122,89 @@ def build_agents(model_client: OpenAIChatCompletionClient):
     )
 
     return coder, reviewer, integrator
+
+
+# ---- Intelligent Selector Functions for SelectorGroupChat ----
+def create_selector_func():
+    """创建智能选择器函数，根据消息内容选择下一个发言者"""
+    def selector_func(messages: List[BaseAgentEvent | BaseChatMessage]) -> str | None:
+        """根据对话上下文智能选择下一个代理"""
+        if not messages:
+            return "coder"  # 空消息时，从 coder 开始
+        
+        last_message = messages[-1]
+        source = getattr(last_message, "source", None)
+        
+        # 用户输入后，让 coder 开始工作
+        if source == "user":
+            return "coder"
+        
+        # coder 完成后，交给 reviewer 审查
+        elif source == "coder":
+            return "reviewer"
+        
+        # reviewer 完成后，交给 integrator 整合
+        elif source == "reviewer":
+            return "integrator"
+        
+        # 其他情况让 LLM 自动选择
+        return None
+    
+    return selector_func
+
+
+def create_candidate_func():
+    """创建候选函数，预筛选可能的下一个发言者"""
+    def candidate_func(messages: List[BaseAgentEvent | BaseChatMessage]) -> List[str]:
+        """根据对话流程预筛选候选代理"""
+        if not messages:
+            return ["coder"]  # 开始时只有 coder 可选
+        
+        last_message = messages[-1]
+        source = getattr(last_message, "source", None)
+        
+        # 用户输入后，只能选择 coder
+        if source == "user":
+            return ["coder"]
+        
+        # coder 完成后，只能选择 reviewer
+        elif source == "coder":
+            return ["reviewer"]
+        
+        # reviewer 完成后，只能选择 integrator
+        elif source == "reviewer":
+            return ["integrator"]
+        
+        # integrator 完成后，任务应该结束（已有 TERMINATE）
+        elif source == "integrator":
+            return ["integrator"]  # 允许但会被终止条件拦截
+        
+        # 默认返回所有代理
+        return ["coder", "reviewer", "integrator"]
+    
+    return candidate_func
+
+
+def create_selector_prompt() -> str:
+    """创建自定义选择器提示词"""
+    return """根据当前对话上下文选择最合适的代理来执行下一步任务。
+
+代理角色说明：
+{roles}
+
+当前对话历史：
+{history}
+
+请从 {participants} 中选择一个代理。
+
+选择原则：
+1. 如果是新任务或用户刚输入需求，选择 coder 开始编码
+2. 如果 coder 刚完成代码，选择 reviewer 进行审查
+3. 如果 reviewer 已给出建议，选择 integrator 整合优化
+4. 如果 integrator 已完成，任务应该结束
+
+只需返回代理名称，不要额外解释。
+"""
 
 
 # ---- Task Record Utilities ----
@@ -288,77 +391,201 @@ def get_next_execution_number() -> int:
     return max(numbers) + 1 if numbers else 1
 
 
-async def run_workflow(task: str, api_key: Optional[str] = None, base_url: Optional[str] = None, 
-                      use_selector: bool = False, save_config: bool = False) -> None:
+async def run_workflow(
+    task: str, 
+    api_key: Optional[str] = None, 
+    base_url: Optional[str] = None, 
+    use_selector: bool = False, 
+    save_config: bool = False,
+    resume_from: Optional[str] = None,
+    use_console_ui: bool = True,
+    timeout_seconds: int = 600
+) -> None:
+    """运行三代理工作流
+    
+    Args:
+        task: 用户的开发需求
+        api_key: Mistral API Key
+        base_url: Mistral API Base URL
+        use_selector: 是否使用 SelectorGroupChat（智能选择）而非 RoundRobinGroupChat
+        save_config: 是否保存团队配置
+        resume_from: 从指定状态文件恢复会话（JSON文件路径）
+        use_console_ui: 是否使用 AutoGen 的 Console UI
+        timeout_seconds: 任务超时时间（秒）
+    """
     # 初始化记录器
     execution_number = get_next_execution_number()
     record_filename = f"task_md/task_record_{execution_number}.md"
+    state_filename = f"task_md/team_state_{execution_number}.json"
     recorder = TaskRecorder(task, execution_number)
 
     model_client = build_model_client(api_key=api_key, base_url=base_url)
-    coder, reviewer, integrator = build_agents(model_client)
-
-    # 改进的终止条件 - 使用ExternalTermination作为备选
-    termination = TextMentionTermination("TERMINATE") | MaxMessageTermination(6)
     
-    # 根据参数选择团队类型
-    if use_selector:
-        # 使用SelectorGroupChat - AutoGen 0.7.4新功能
-        # 允许基于消息内容选择下一个说话者
-        selector = SelectorGroupChat(
-            participants=[coder, reviewer, integrator],
-            termination_condition=termination,
-            selector_func=lambda messages, participants: participants[0] if len(messages) % 3 == 0 else participants[1] if len(messages) % 3 == 1 else participants[2]
+    try:
+        coder, reviewer, integrator = build_agents(model_client)
+
+        # 改进的终止条件 - 组合多种条件提供全面保护
+        termination = (
+            TextMentionTermination("TERMINATE") |           # 检测 TERMINATE 关键词
+            MaxMessageTermination(20) |                     # 最多20条消息防止无限循环
+            TimeoutTermination(timeout_seconds) |           # 超时保护
+            SourceMatchTermination(["integrator"])          # integrator 完成后可结束
         )
-        team = selector
-    else:
-        # 使用传统的RoundRobinGroupChat
-        team = RoundRobinGroupChat([coder, reviewer, integrator], termination_condition=termination, max_turns=3)
-    
-    # 保存团队配置 - AutoGen 0.7.4新功能
-    if save_config:
-        config = {
-            "agents": [
-                {"name": agent.name, "description": agent.description, "system_message": agent.system_message}
-                for agent in [coder, reviewer, integrator]
-            ],
-            "termination_condition": {
-                "type": "TextMentionTermination",
-                "text": "TERMINATE"
-            },
-            "team_type": "SelectorGroupChat" if use_selector else "RoundRobinGroupChat"
-        }
         
-        config_filename = f"task_md/team_config_{execution_number}.json"
-        with open(config_filename, "w", encoding="utf-8") as f:
-            json.dump(config, f, ensure_ascii=False, indent=2)
-        print(f"团队配置已保存到 {config_filename}")
+        # 根据参数选择团队类型
+        if use_selector:
+            # 使用 SelectorGroupChat - 基于消息内容智能选择下一个发言者
+            print("使用 SelectorGroupChat 模式（智能选择）")
+            team = SelectorGroupChat(
+                participants=[coder, reviewer, integrator],
+                model_client=model_client,
+                termination_condition=termination,
+                selector_func=create_selector_func(),
+                candidate_func=create_candidate_func(),
+                selector_prompt=create_selector_prompt(),
+                allow_repeated_speaker=False  # 不允许同一代理连续发言
+            )
+        else:
+            # 使用 RoundRobinGroupChat - 固定顺序轮流发言
+            print("使用 RoundRobinGroupChat 模式（轮流发言）")
+            team = RoundRobinGroupChat(
+                [coder, reviewer, integrator], 
+                termination_condition=termination
+            )
+        
+        # 如果指定了恢复点，加载之前的状态
+        if resume_from and os.path.exists(resume_from):
+            print(f"从状态文件恢复会话: {resume_from}")
+            with open(resume_from, "r", encoding="utf-8") as f:
+                saved_state = json.load(f)
+            await team.load_state(saved_state)
+        
+        # 保存团队配置
+        if save_config:
+            config = {
+                "agents": [
+                    {
+                        "name": agent.name, 
+                        "description": agent.description, 
+                        "system_message": agent.system_message
+                    }
+                    for agent in [coder, reviewer, integrator]
+                ],
+                "termination_condition": {
+                    "types": ["TextMentionTermination", "MaxMessageTermination", "TimeoutTermination", "SourceMatchTermination"],
+                    "details": {
+                        "text_mention": "TERMINATE",
+                        "max_messages": 20,
+                        "timeout_seconds": timeout_seconds,
+                        "source_match": ["integrator"]
+                    }
+                },
+                "team_type": "SelectorGroupChat" if use_selector else "RoundRobinGroupChat",
+                "execution_number": execution_number
+            }
+            
+            config_filename = f"task_md/team_config_{execution_number}.json"
+            with open(config_filename, "w", encoding="utf-8") as f:
+                json.dump(config, f, ensure_ascii=False, indent=2)
+            print(f"团队配置已保存到 {config_filename}")
 
-    # 收集事件并打印到控制台
-    async for message in team.run_stream(task=task):
-        source = getattr(message, "source", getattr(message, "name", "unknown")) or "unknown"
-        content = getattr(message, "content", None)
-        if content is None:
-            # Try common alternative attribute
-            content = getattr(message, "text", None)
-        if content is None:
-            content = str(message)
-        recorder.add_message(source, str(content))
+        # 执行任务
+        if use_console_ui:
+            # 使用 AutoGen 的 Console UI - 提供更好的格式化输出
+            print(f"\n{'='*60}")
+            print(f"开始执行任务 (执行编号: {execution_number})")
+            print(f"{'='*60}\n")
+            
+            # 使用 Console UI 流式输出，并收集消息用于记录
+            async for message in team.run_stream(task=task):
+                # 提取消息信息
+                source = getattr(message, "source", "unknown")
+                
+                # 处理不同类型的消息
+                if isinstance(message, TaskResult):
+                    content = f"任务完成 - 停止原因: {message.stop_reason}"
+                else:
+                    content = getattr(message, "content", None)
+                    if content is None:
+                        content = str(message)
+                
+                # 记录消息
+                recorder.add_message(source, str(content))
+                
+                # 使用 Console 格式化输出
+                print(f"\n{'─'*60}")
+                print(f"📤 {source}")
+                print(f"{'─'*60}")
+                preview = content if isinstance(content, str) else str(content)
+                print(preview if len(preview) < 3000 else preview[:3000] + "\n... (内容过长，已截断) ...")
+        else:
+            # 使用自定义轻量输出
+            async for message in team.run_stream(task=task):
+                source = getattr(message, "source", "unknown")
+                content = getattr(message, "content", None)
+                if content is None:
+                    content = str(message)
+                recorder.add_message(source, str(content))
 
-        # 控制台轻量输出
-        print(f"----- {source} -----")
-        preview = content if isinstance(content, str) else str(content)
-        print(preview if len(preview) < 2000 else preview[:2000] + "…")
-        print()
+                print(f"----- {source} -----")
+                preview = content if isinstance(content, str) else str(content)
+                print(preview if len(preview) < 2000 else preview[:2000] + "…")
+                print()
 
-    recorder.finalize()
-    recorder.write(record_filename)
-
-    await model_client.close()
+        # 保存团队状态（用于可能的恢复）
+        team_state = await team.save_state()
+        with open(state_filename, "w", encoding="utf-8") as f:
+            json.dump(team_state, f, ensure_ascii=False, indent=2)
+        print(f"\n团队状态已保存到 {state_filename}")
+        
+        # 完成记录
+        recorder.finalize()
+        recorder.write(record_filename)
+        print(f"执行记录已保存到 {record_filename}\n")
+        
+    except asyncio.CancelledError:
+        print("\n任务被用户取消")
+        recorder.add_message("system", "任务被用户取消")
+        recorder.finalize()
+        recorder.write(record_filename)
+        raise
+        
+    except Exception as e:
+        print(f"\n执行出错: {e}")
+        import traceback
+        traceback.print_exc()
+        recorder.add_message("system", f"Error: {str(e)}\n{traceback.format_exc()}")
+        recorder.finalize()
+        recorder.write(record_filename)
+        raise
+        
+    finally:
+        # 确保关闭模型客户端连接
+        await model_client.close()
 
 
 def parse_args(argv: List[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="3-Agent AutoGen 工作流: coder -> reviewer -> integrator")
+    parser = argparse.ArgumentParser(
+        description="3-Agent AutoGen 工作流: coder -> reviewer -> integrator",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例用法:
+  # 基本用法（RoundRobin模式）
+  python improved_three_agent_workflow.py --task "编写一个CSV转JSON的Python脚本"
+  
+  # 使用智能选择器模式
+  python improved_three_agent_workflow.py --task "实现快速排序算法" --use-selector
+  
+  # 保存配置和状态
+  python improved_three_agent_workflow.py --task "创建REST API客户端" --save-config
+  
+  # 从之前的状态恢复
+  python improved_three_agent_workflow.py --resume task_md/team_state_1.json
+  
+  # 自定义超时和禁用Console UI
+  python improved_three_agent_workflow.py --task "数据分析脚本" --timeout 300 --no-console-ui
+        """
+    )
     parser.add_argument(
         "--task",
         required=False,
@@ -380,13 +607,32 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
         "--use-selector",
         dest="use_selector",
         action="store_true",
-        help="使用SelectorGroupChat替代RoundRobinGroupChat（AutoGen 0.7.4新功能）",
+        help="使用 SelectorGroupChat 替代 RoundRobinGroupChat（智能选择下一个发言者）",
     )
     parser.add_argument(
         "--save-config",
         dest="save_config",
         action="store_true",
-        help="保存团队配置到JSON文件（AutoGen 0.7.4新功能）",
+        help="保存团队配置到JSON文件",
+    )
+    parser.add_argument(
+        "--resume",
+        dest="resume_from",
+        default=None,
+        help="从指定的状态文件恢复会话（JSON文件路径），例如: task_md/team_state_1.json",
+    )
+    parser.add_argument(
+        "--no-console-ui",
+        dest="no_console_ui",
+        action="store_true",
+        help="禁用 AutoGen Console UI，使用简单的文本输出",
+    )
+    parser.add_argument(
+        "--timeout",
+        dest="timeout_seconds",
+        type=int,
+        default=600,
+        help="任务执行超时时间（秒），默认600秒（10分钟）",
     )
     return parser.parse_args(argv)
 
@@ -402,16 +648,29 @@ def prompt_if_needed(text: Optional[str]) -> str:
 
 def main(argv: List[str]) -> int:
     args = parse_args(argv)
-    task = prompt_if_needed(args.task)
-    if not task:
-        print("[ERROR] 必须提供开发需求 --task 或在提示符输入。", file=sys.stderr)
-        return 2
+    
+    # 如果指定了恢复，任务可以为空
+    if args.resume_from:
+        if not os.path.exists(args.resume_from):
+            print(f"[ERROR] 恢复文件不存在: {args.resume_from}", file=sys.stderr)
+            return 2
+        print(f"将从状态文件恢复: {args.resume_from}")
+        task = args.task or "继续之前的任务"
+    else:
+        task = prompt_if_needed(args.task)
+        if not task:
+            print("[ERROR] 必须提供开发需求 --task 或在提示符输入。", file=sys.stderr)
+            return 2
+    
     asyncio.run(run_workflow(
-        task, 
+        task=task, 
         api_key=args.mistral_api_key, 
         base_url=args.mistral_base_url,
         use_selector=args.use_selector,
-        save_config=args.save_config
+        save_config=args.save_config,
+        resume_from=args.resume_from,
+        use_console_ui=not args.no_console_ui,
+        timeout_seconds=args.timeout_seconds
     ))
     return 0
 
